@@ -130,8 +130,6 @@ We've been using Lad daily for months in our production work. It's caught countl
 
 If you give it a try or like the idea, please drop us a star on GitHub – it's huge motivation for us to keep improving it! ⭐️
 
-**P.S.** Check out our [Kindly Web Search MCP server](https://github.com/Shelpuk-AI-Technology-Consulting/kindly-web-search-mcp-server) – perhaps the only web search MCP for coding agents that actually works. It pairs perfectly with Lad for a complete research-and-review workflow.
-
 ## What Lad replaces
 
 Lad eliminates the need for:
