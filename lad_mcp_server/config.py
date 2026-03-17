@@ -139,9 +139,9 @@ class Settings:
             )
             or "moonshotai/kimi-k2.5",
             openrouter_secondary_reviewer_model=_get_str(
-                "OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-5"
+                "OPENROUTER_SECONDARY_REVIEWER_MODEL", "z-ai/glm-5-turbo"
             )
-            or "z-ai/glm-5",
+            or "z-ai/glm-5-turbo",
             openrouter_http_referer=_get_str("OPENROUTER_HTTP_REFERER"),
             openrouter_x_title=_get_str("OPENROUTER_X_TITLE"),
             openrouter_reviewer_timeout_seconds=reviewer_timeout,
