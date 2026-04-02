@@ -5,6 +5,8 @@ import atexit
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,7 @@ from lad_mcp_server.config import Settings
 from lad_mcp_server.file_context import FileContextBuilder
 from lad_mcp_server.markdown import final_egress_redaction, format_aggregated_output
 from lad_mcp_server.model_metadata import ModelMetadataError, OpenRouterModelsClient
-from lad_mcp_server.openrouter_client import OpenRouterClient, OpenRouterClientError
+from lad_mcp_server.openrouter_client import OpenRouterCallResult, OpenRouterClient, OpenRouterClientError
 from lad_mcp_server.path_utils import is_dangerous_repo_root
 from lad_mcp_server.prompts import (
     force_finalize_system_message,
@@ -33,6 +35,8 @@ log = logging.getLogger(__name__)
 
 CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for mixed tokenizers
 OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS = 5  # avoid racing external tool-call deadlines
+TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
+TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
@@ -111,6 +115,117 @@ class ReviewService:
         # inference; otherwise CWD), so Lad can be used across many projects with one MCP configuration.
         self._default_repo_root = repo_root.resolve() if repo_root is not None else None
         self._tool_executor = _TOOL_EXECUTOR
+        self._tool_choice_fallback_until_by_model: dict[str, float] = {}
+        self._tool_choice_fallback_lock = threading.Lock()
+
+    @staticmethod
+    def _tool_choice_model_key(model: str) -> str:
+        return model.strip()
+
+    def _is_tool_choice_fallback_active(self, model: str) -> bool:
+        key = self._tool_choice_model_key(model)
+        now = time.monotonic()
+        with self._tool_choice_fallback_lock:
+            expires_at = self._tool_choice_fallback_until_by_model.get(key)
+            if expires_at is None:
+                self._cleanup_tool_choice_fallback_cache_locked(now)
+                return False
+            if expires_at <= now:
+                self._tool_choice_fallback_until_by_model.pop(key, None)
+                self._cleanup_tool_choice_fallback_cache_locked(now)
+                return False
+            self._cleanup_tool_choice_fallback_cache_locked(now)
+            return True
+
+    def _remember_tool_choice_fallback(self, model: str) -> None:
+        key = self._tool_choice_model_key(model)
+        now = time.monotonic()
+        with self._tool_choice_fallback_lock:
+            already_active = (self._tool_choice_fallback_until_by_model.get(key) or 0.0) > now
+            self._tool_choice_fallback_until_by_model[key] = now + float(TOOL_CHOICE_FALLBACK_TTL_SECONDS)
+            self._cleanup_tool_choice_fallback_cache_locked(now)
+        if not already_active:
+            log.info("Tool-choice fallback cache activated for model '%s' (%ss)", key, TOOL_CHOICE_FALLBACK_TTL_SECONDS)
+
+    def _cleanup_tool_choice_fallback_cache_locked(self, now: float) -> None:
+        expired = [k for k, v in self._tool_choice_fallback_until_by_model.items() if v <= now]
+        for k in expired:
+            self._tool_choice_fallback_until_by_model.pop(k, None)
+        while len(self._tool_choice_fallback_until_by_model) > TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS:
+            oldest_key = min(self._tool_choice_fallback_until_by_model, key=self._tool_choice_fallback_until_by_model.get)
+            self._tool_choice_fallback_until_by_model.pop(oldest_key, None)
+
+    @staticmethod
+    def _is_retryable_tool_choice_compatibility_error(exc: OpenRouterClientError) -> bool:
+        msg = _exc_message(exc).lower()
+        if "tool_choice" not in msg:
+            return False
+        return (
+            "no endpoints found" in msg
+            or "support the provided" in msg
+            or "unsupported" in msg
+            or "routing" in msg
+        )
+
+    @staticmethod
+    def _build_tool_choice_attempts(
+        *,
+        tools: list[dict[str, Any]] | None,
+        preferred: str | dict[str, Any] | None,
+    ) -> list[str | dict[str, Any] | None]:
+        attempts: list[str | dict[str, Any] | None] = [preferred]
+        if not tools:
+            return attempts
+
+        if not any(a == "auto" for a in attempts):
+            attempts.append("auto")
+        if not any(a is None for a in attempts):
+            attempts.append(None)
+        return attempts
+
+    async def _call_openrouter_with_tool_choice_fallback(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        timeout_seconds: int,
+        max_output_tokens: int,
+        tools: list[dict[str, Any]] | None,
+        preferred_tool_choice: str | dict[str, Any] | None,
+        extra_body: dict[str, Any] | None,
+    ) -> OpenRouterCallResult:
+        attempts = self._build_tool_choice_attempts(tools=tools, preferred=preferred_tool_choice)
+        last_exc: OpenRouterClientError | None = None
+        for idx, tool_choice in enumerate(attempts):
+            try:
+                return await self._openrouter.chat_completion(
+                    model=model,
+                    messages=messages,
+                    timeout_seconds=timeout_seconds,
+                    max_output_tokens=max_output_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    extra_body=extra_body,
+                )
+            except OpenRouterClientError as exc:
+                last_exc = exc
+                if not tools or not self._is_retryable_tool_choice_compatibility_error(exc):
+                    raise
+                if tool_choice is not None:
+                    self._remember_tool_choice_fallback(model)
+                if idx == len(attempts) - 1:
+                    raise
+                log.info(
+                    "Retrying OpenRouter call for model '%s' with fallback tool_choice=%r",
+                    model,
+                    attempts[idx + 1],
+                )
+                continue
+
+        # Defensive; loop always returns or raises.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("OpenRouter fallback call ended without result")
 
     @staticmethod
     def _walk_up_for_project_root(start: Path, *, max_depth: int = 25) -> Path:
@@ -584,18 +699,22 @@ class ReviewService:
                     else:
                         tool_choice = "auto"
 
+            if tools and isinstance(tool_choice, dict) and self._is_tool_choice_fallback_active(model):
+                log.info("Using cached fallback tool_choice='auto' for model '%s'", model)
+                tool_choice = "auto"
+
             call_timeout_seconds = max(
                 int(reviewer_timeout_seconds) - int(OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS),
                 1,
             )
 
-            result = await self._openrouter.chat_completion(
+            result = await self._call_openrouter_with_tool_choice_fallback(
                 model=model,
                 messages=messages,
                 timeout_seconds=call_timeout_seconds,
                 max_output_tokens=max_output_tokens,
                 tools=tools,
-                tool_choice=tool_choice,
+                preferred_tool_choice=tool_choice,
                 extra_body=extra_body,
             )
 
