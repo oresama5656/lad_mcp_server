@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,7 +34,7 @@ class _OpenRouterClientStub:
 
     async def chat_completion(self, *, model, messages, timeout_seconds, max_output_tokens, tools=None, tool_choice=None, extra_body=None):
         # Minimal tool-loop simulator:
-        # - honor forced tool_choice preflight (activate_project, read_project_overview)
+        # - honor forced tool_choice preflight (activate_project, read_project_overview, read_baseline_memories)
         # - then return a final content response.
         async with self._get_lock():
             idx = self._calls.get(model, 0)
@@ -71,6 +72,23 @@ class _OpenRouterClientStub:
                             "id": f"tc{idx}",
                             "type": "function",
                             "function": {"name": "read_project_overview", "arguments": "{}"},
+                        }
+                    ],
+                    "raw": {},
+                },
+            )()
+
+        if tools and forced_name == "read_baseline_memories":
+            return type(
+                "R",
+                (),
+                {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"tc{idx}",
+                            "type": "function",
+                            "function": {"name": "read_baseline_memories", "arguments": "{}"},
                         }
                     ],
                     "raw": {},
@@ -1122,6 +1140,388 @@ class TestReviewServiceToolLoop(unittest.TestCase):
             )
             self.assertTrue(client.saw_hint)
             self.assertIn("## Tooling Degradation Summary", out)
+
+    def test_preflight_forces_read_baseline_memories_after_overview(self) -> None:
+        class _SerenaCtx:
+            activated_project = None
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [
+                    {"type": "function", "function": {"name": "activate_project", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "read_project_overview", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "read_baseline_memories", "parameters": {"type": "object"}}},
+                ]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                if name == "activate_project":
+                    self.activated_project = "."
+                if name == "read_baseline_memories":
+                    result = {
+                        "required": ["project_overview.md", "research_summary.md"],
+                        "present": ["project_overview.md"],
+                        "loaded": [{"name": "project_overview.md", "content": "overview"}],
+                        "missing": ["research_summary.md"],
+                    }
+                    return json.dumps(
+                        {
+                            "tool_status": "ok",
+                            "tool_name": "read_baseline_memories",
+                            "tool_budget": {
+                                "max_total_chars": 10000,
+                                "used_chars": 0,
+                                "remaining_chars": 10000,
+                                "emitted_chars_this_call": 1,
+                            },
+                            "tool_result_json": json.dumps(result),
+                        }
+                    )
+                return "{}"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.tool_choice_names: list[str] = []
+                self.calls = 0
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                forced_name = None
+                if isinstance(tool_choice, dict):
+                    forced_name = (tool_choice.get("function") or {}).get("name")
+                    if forced_name:
+                        self.tool_choice_names.append(forced_name)
+
+                if forced_name == "activate_project":
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "activate_project", "arguments": "{\"project\": \".\"}"}}],
+                            "raw": {},
+                        },
+                    )()
+                if forced_name == "read_project_overview":
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [{"id": "t2", "type": "function", "function": {"name": "read_project_overview", "arguments": "{}"}}],
+                            "raw": {},
+                        },
+                    )()
+                if forced_name == "read_baseline_memories":
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [{"id": "t3", "type": "function", "function": {"name": "read_baseline_memories", "arguments": "{}"}}],
+                            "raw": {},
+                        },
+                    )()
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools", "tool_choice"),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=6,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            serena = _SerenaCtx()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=serena.tool_schemas(),
+                    tool_choice_supported=True,
+                    serena_ctx=serena,
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=6,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertEqual(out, "ok")
+            self.assertEqual(client.tool_choice_names[:3], ["activate_project", "read_project_overview", "read_baseline_memories"])
+
+    def test_tool_loop_emits_post_preflight_validation_message_with_missing_memories(self) -> None:
+        class _SerenaCtx:
+            activated_project = None
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [
+                    {"type": "function", "function": {"name": "activate_project", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "read_project_overview", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "read_baseline_memories", "parameters": {"type": "object"}}},
+                ]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                if name == "activate_project":
+                    self.activated_project = "."
+                    return "{}"
+                if name == "read_project_overview":
+                    return "{}"
+                if name == "read_baseline_memories":
+                    result = {
+                        "required": ["project_overview.md", "research_summary.md"],
+                        "present": ["project_overview.md"],
+                        "loaded": [{"name": "project_overview.md", "content": "overview"}],
+                        "missing": ["research_summary.md"],
+                    }
+                    return json.dumps(
+                        {
+                            "tool_status": "ok",
+                            "tool_name": "read_baseline_memories",
+                            "tool_budget": {
+                                "max_total_chars": 10000,
+                                "used_chars": 0,
+                                "remaining_chars": 10000,
+                                "emitted_chars_this_call": 1,
+                            },
+                            "tool_result_json": json.dumps(result),
+                        }
+                    )
+                return "{}"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_validation_message = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                forced_name = None
+                if isinstance(tool_choice, dict):
+                    forced_name = (tool_choice.get("function") or {}).get("name")
+                if forced_name == "activate_project":
+                    return type("R", (), {"content": None, "tool_calls": [{"id": "a1", "type": "function", "function": {"name": "activate_project", "arguments": "{\"project\": \".\"}"}}], "raw": {}})()
+                if forced_name == "read_project_overview":
+                    return type("R", (), {"content": None, "tool_calls": [{"id": "a2", "type": "function", "function": {"name": "read_project_overview", "arguments": "{}"}}], "raw": {}})()
+                if forced_name == "read_baseline_memories":
+                    return type("R", (), {"content": None, "tool_calls": [{"id": "a3", "type": "function", "function": {"name": "read_baseline_memories", "arguments": "{}"}}], "raw": {}})()
+
+                self.saw_validation_message = any(
+                    msg.get("role") == "system"
+                    and "missing required preflight memories" in str(msg.get("content", "")).lower()
+                    and "research_summary.md" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools", "tool_choice"),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=6,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            serena = _SerenaCtx()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=serena.tool_schemas(),
+                    tool_choice_supported=True,
+                    serena_ctx=serena,
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=6,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertEqual(out, "ok")
+            self.assertTrue(client.saw_validation_message)
+
+    def test_tool_loop_warns_on_deeper_exploration_when_memory_checklist_skipped(self) -> None:
+        class _SerenaCtx:
+            activated_project = None
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [
+                    {"type": "function", "function": {"name": "activate_project", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "read_memory", "parameters": {"type": "object"}}},
+                ]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                if name == "activate_project":
+                    self.activated_project = "."
+                return "{}"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_skipped_warning = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                # No forced tool-choice support in this test; simulate model skipping memory preflight.
+                if self.calls == 1:
+                    return type("R", (), {"content": None, "tool_calls": [{"id": "x1", "type": "function", "function": {"name": "activate_project", "arguments": "{\"project\": \".\"}"}}], "raw": {}})()
+                if self.calls == 2:
+                    return type("R", (), {"content": None, "tool_calls": [{"id": "x2", "type": "function", "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}}], "raw": {}})()
+
+                self.saw_skipped_warning = any(
+                    msg.get("role") == "system"
+                    and "skipped required preflight memories" in str(msg.get("content", "")).lower()
+                    for msg in messages
+                )
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=6,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            serena = _SerenaCtx()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=serena.tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=serena,
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=6,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertEqual(out, "ok")
+            self.assertTrue(client.saw_skipped_warning)
 
 
 if __name__ == "__main__":

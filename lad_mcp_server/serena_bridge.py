@@ -15,6 +15,7 @@ from lad_mcp_server.path_utils import safe_resolve_under_repo
 
 LARGE_FILE_READ_MAX_BYTES = 1_000_000
 LARGE_FILE_HEAD_WARNING_LINES = 400
+BASELINE_REQUIRED_MEMORIES = ("project_overview.md", "research_summary.md")
 
 
 class SerenaToolError(RuntimeError):
@@ -119,6 +120,17 @@ class SerenaContext:
                 "function": {
                     "name": "read_project_overview",
                     "description": "Read the Serena memory `.serena/memories/project_overview.md` (if present).",
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_baseline_memories",
+                    "description": (
+                        "Fetch required baseline memories in one preflight call "
+                        "(project_overview.md and research_summary.md)."
+                    ),
                     "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
@@ -251,6 +263,8 @@ class SerenaContext:
             result = self._activate_project(args.get("project"))
         elif name == "read_project_overview":
             result = self._read_memory("project_overview")
+        elif name == "read_baseline_memories":
+            result = self._read_baseline_memories()
         elif name == "read_memory":
             result = self._read_memory(args.get("name"))
         elif name == "list_dir":
@@ -347,6 +361,33 @@ class SerenaContext:
         self.used_memories.add(filename)
         content = path.read_text(encoding="utf-8", errors="replace")
         return {"name": filename, "content": content}
+
+    def _read_baseline_memories(self) -> dict[str, Any]:
+        required = list(BASELINE_REQUIRED_MEMORIES)
+        if not self.memories_dir.is_dir():
+            return {"required": required, "present": [], "loaded": [], "missing": required}
+
+        available = {p.name for p in self.memories_dir.glob("*.md") if p.is_file()}
+        present = [name for name in required if name in available]
+        missing = [name for name in required if name not in available]
+
+        loaded: list[dict[str, str]] = []
+        for name in present:
+            try:
+                mem = self._read_memory(name)
+            except SerenaToolError:
+                missing.append(name)
+                continue
+            loaded.append({"name": mem["name"], "content": mem["content"]})
+
+        # Keep deterministic order.
+        missing = sorted(set(missing), key=required.index if required else None)
+        return {
+            "required": required,
+            "present": present,
+            "loaded": loaded,
+            "missing": missing,
+        }
 
     def _list_dir(self, path: Any) -> dict[str, Any]:
         if not isinstance(path, str) or path.strip() == "":

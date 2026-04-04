@@ -8,6 +8,27 @@ from lad_mcp_server.serena_bridge import SerenaContext, SerenaLimits, SerenaTool
 
 
 class TestSerenaBridge(unittest.TestCase):
+    def test_tool_schemas_include_read_baseline_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            schemas = ctx.tool_schemas()
+            baseline = next(s for s in schemas if (s.get("function") or {}).get("name") == "read_baseline_memories")
+            params = (baseline.get("function") or {}).get("parameters") or {}
+            self.assertEqual(params.get("required"), [])
+            self.assertEqual(params.get("type"), "object")
+
     def test_tool_schemas_include_read_file_window(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -257,6 +278,61 @@ class TestSerenaBridge(unittest.TestCase):
 
             with self.assertRaises(SerenaToolError):
                 ctx.call_tool("read_file", "{\"path\": \"big.txt\"}")
+
+    def test_read_baseline_memories_returns_required_present_loaded_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena" / "memories").mkdir(parents=True)
+            (repo / ".serena" / "memories" / "project_overview.md").write_text("overview", encoding="utf-8")
+            (repo / ".serena" / "memories" / "research_summary.md").write_text("summary", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=6000,
+                    max_total_chars=12000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_baseline_memories", "{}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["required"], ["project_overview.md", "research_summary.md"])
+            self.assertEqual(result["missing"], [])
+            self.assertEqual(result["present"], ["project_overview.md", "research_summary.md"])
+            loaded_names = [item.get("name") for item in result["loaded"]]
+            self.assertEqual(loaded_names, ["project_overview.md", "research_summary.md"])
+            self.assertIn("overview", result["loaded"][0]["content"])
+            self.assertIn("summary", result["loaded"][1]["content"])
+
+    def test_read_baseline_memories_reports_missing_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena" / "memories").mkdir(parents=True)
+            (repo / ".serena" / "memories" / "project_overview.md").write_text("overview", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=6000,
+                    max_total_chars=12000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_baseline_memories", "{}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["required"], ["project_overview.md", "research_summary.md"])
+            self.assertEqual(result["present"], ["project_overview.md"])
+            self.assertEqual(result["missing"], ["research_summary.md"])
+            loaded_names = [item.get("name") for item in result["loaded"]]
+            self.assertEqual(loaded_names, ["project_overview.md"])
 
     def test_read_file_allows_large_file_with_head(self) -> None:
         with tempfile.TemporaryDirectory() as td:

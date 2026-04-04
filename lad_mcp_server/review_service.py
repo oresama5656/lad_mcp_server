@@ -27,7 +27,7 @@ from lad_mcp_server.prompts import (
 )
 from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.schemas import CodeReviewRequest, SystemDesignReviewRequest, ValidationError
-from lad_mcp_server.serena_bridge import SerenaContext, SerenaLimits, SerenaToolError
+from lad_mcp_server.serena_bridge import BASELINE_REQUIRED_MEMORIES, SerenaContext, SerenaLimits, SerenaToolError
 from lad_mcp_server.token_budget import TokenBudget, TokenBudgetError
 
 
@@ -41,6 +41,9 @@ CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
 TOOL_DEGRADATION_SYSTEM_HINT = (
     "Tool budget/state failed for the latest tool output. "
     "Treat recent tool output as unreliable and continue conservatively."
+)
+DEEPER_EXPLORATION_TOOL_NAMES = frozenset(
+    {"list_dir", "read_file", "read_file_window", "search_for_pattern", "find_symbol"}
 )
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8)
@@ -112,6 +115,54 @@ def _append_tooling_degradation_summary(
         "- Notes: tool budget/state failed in the Serena loop; output may be partially degraded.\n"
     )
     return base + summary
+
+
+def _normalize_memory_name(name: str) -> str:
+    return name if name.endswith(".md") else f"{name}.md"
+
+
+def _load_json_object(text: str | None) -> dict[str, Any] | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _extract_read_memory_name(arguments_json: str) -> str | None:
+    args = _load_json_object(arguments_json)
+    if args is None:
+        return None
+    raw_name = args.get("name")
+    if not isinstance(raw_name, str) or raw_name.strip() == "":
+        return None
+    return _normalize_memory_name(raw_name.strip())
+
+
+def _extract_tool_result_object(tool_output: str) -> dict[str, Any] | None:
+    outer = _load_json_object(tool_output)
+    if outer is None:
+        return None
+    inner_raw = outer.get("tool_result_json")
+    inner = _load_json_object(inner_raw) if isinstance(inner_raw, str) else None
+    return inner if inner is not None else outer
+
+
+def _preflight_validation_message(missing_required: set[str]) -> str:
+    if not missing_required:
+        return "Preflight memory checklist validation: all required preflight memories are loaded."
+    missing = ", ".join(sorted(missing_required))
+    return f"Preflight memory checklist validation: missing required preflight memories: {missing}."
+
+
+def _skipped_preflight_warning_message(missing_required: set[str]) -> str:
+    missing = ", ".join(sorted(missing_required))
+    return (
+        "Skipped required preflight memories before deeper exploration: "
+        f"{missing}. Call `read_baseline_memories` or `read_memory` to fill gaps."
+    )
 
 
 @dataclass(frozen=True)
@@ -730,6 +781,11 @@ class ReviewService:
     ) -> str:
         remaining_tool_calls = max_tool_calls
         did_force_project_overview = False
+        did_force_baseline_memories = False
+        required_memories = set(BASELINE_REQUIRED_MEMORIES)
+        covered_required_memories: set[str] = set()
+        preflight_validation_emitted = False
+        skipped_preflight_warning_emitted = False
         degraded_outputs_count = 0
         consecutive_degraded_outputs = 0
         consecutive_guard_triggered = False
@@ -749,6 +805,12 @@ class ReviewService:
                     did_force_project_overview = True
                     if tool_choice_supported:
                         tool_choice = {"type": "function", "function": {"name": "read_project_overview"}}
+                    else:
+                        tool_choice = "auto"
+                elif not did_force_baseline_memories:
+                    did_force_baseline_memories = True
+                    if tool_choice_supported:
+                        tool_choice = {"type": "function", "function": {"name": "read_baseline_memories"}}
                     else:
                         tool_choice = "auto"
 
@@ -813,7 +875,7 @@ class ReviewService:
 
                 # Preflight tools are intentionally lightweight and safe to run inline; keeping them out of the
                 # threadpool avoids startup/scheduling delays that can cause false timeouts in short-review tests.
-                if fn_name in {"activate_project", "read_project_overview"}:
+                if fn_name in {"activate_project", "read_project_overview", "read_baseline_memories"}:
                     tool_out = _run_tool_sync()
                 else:
                     loop = asyncio.get_running_loop()
@@ -826,6 +888,44 @@ class ReviewService:
                         tool_out = json.dumps({"error": f"tool call timed out after {tool_timeout_seconds}s"})
 
                 messages.append(_build_tool_message(tc_id, fn_name, tool_out))
+
+                if fn_name == "read_project_overview":
+                    covered_required_memories.add("project_overview.md")
+                elif fn_name == "read_memory":
+                    memory_name = _extract_read_memory_name(fn_args)
+                    if memory_name in required_memories:
+                        covered_required_memories.add(memory_name)
+                elif fn_name == "read_baseline_memories":
+                    baseline = _extract_tool_result_object(tool_out) or {}
+                    present = baseline.get("present")
+                    if isinstance(present, list):
+                        for item in present:
+                            if isinstance(item, str):
+                                name = _normalize_memory_name(item)
+                                if name in required_memories:
+                                    covered_required_memories.add(name)
+                    loaded = baseline.get("loaded")
+                    if isinstance(loaded, list):
+                        for item in loaded:
+                            if isinstance(item, dict):
+                                raw_name = item.get("name")
+                                if isinstance(raw_name, str):
+                                    name = _normalize_memory_name(raw_name)
+                                    if name in required_memories:
+                                        covered_required_memories.add(name)
+                    if not preflight_validation_emitted:
+                        missing_required = required_memories - covered_required_memories
+                        messages.append(_build_system_message(_preflight_validation_message(missing_required)))
+                        preflight_validation_emitted = True
+
+                missing_required = required_memories - covered_required_memories
+                if fn_name in DEEPER_EXPLORATION_TOOL_NAMES and missing_required:
+                    if not preflight_validation_emitted:
+                        messages.append(_build_system_message(_preflight_validation_message(missing_required)))
+                        preflight_validation_emitted = True
+                    if not skipped_preflight_warning_emitted:
+                        messages.append(_build_system_message(_skipped_preflight_warning_message(missing_required)))
+                        skipped_preflight_warning_emitted = True
 
                 is_degraded, _reason = _is_degraded_tool_output(tool_out)
                 if is_degraded:
