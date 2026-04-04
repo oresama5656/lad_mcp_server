@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -147,6 +148,89 @@ class TestSerenaBridge(unittest.TestCase):
 
             out = ctx.call_tool("read_file", "{\"path\": \"big.txt\", \"head\": 1}")
             self.assertIn("first", out)
+
+    def test_tool_output_includes_status_and_budget_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("hello\nworld\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\", \"head\": 1}")
+            payload = json.loads(out)
+
+            self.assertEqual(payload["tool_status"], "ok")
+            self.assertEqual(payload["tool_name"], "read_file")
+            self.assertIn("tool_budget", payload)
+            self.assertIn("tool_result_json", payload)
+            self.assertIn("hello", payload["tool_result_json"])
+            self.assertIn("max_total_chars", payload["tool_budget"])
+            self.assertIn("used_chars", payload["tool_budget"])
+            self.assertIn("remaining_chars", payload["tool_budget"])
+            self.assertIn("emitted_chars_this_call", payload["tool_budget"])
+
+    def test_tool_output_marks_truncated_when_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("x" * 500, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=40,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            payload = json.loads(out)
+
+            self.assertEqual(payload["tool_status"], "truncated")
+            self.assertIn("note", payload)
+            self.assertLessEqual(payload["tool_budget"]["emitted_chars_this_call"], 40)
+            self.assertLessEqual(len(payload["tool_result_json"]), 40)
+
+    def test_budget_exhausted_returns_structured_payload_not_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("x" * 500, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=200,
+                    max_total_chars=60,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            # First call burns the remaining budget.
+            ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            out = ctx.call_tool("list_memories", "{}")
+
+            self.assertNotEqual(out, "")
+            payload = json.loads(out)
+            self.assertEqual(payload["tool_status"], "budget_exhausted")
+            self.assertIn("error", payload)
+            self.assertIn("hint", payload)
+            self.assertEqual(payload["tool_budget"]["remaining_chars"], 0)
 
 
 if __name__ == "__main__":

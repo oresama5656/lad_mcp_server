@@ -29,10 +29,12 @@ class TestSettingsTimeoutDefaults(unittest.TestCase):
         os.environ["OPENROUTER_API_KEY"] = "test"
         os.environ.pop("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", None)
         os.environ.pop("OPENROUTER_TOOL_CALL_TIMEOUT_SECONDS", None)
+        os.environ.pop("LAD_SERENA_MAX_TOTAL_CHARS", None)
 
         s = Settings.from_env()
         self.assertEqual(s.openrouter_reviewer_timeout_seconds, 300)
         self.assertEqual(s.openrouter_tool_call_timeout_seconds, 360)
+        self.assertEqual(s.lad_serena_max_total_chars, 100000)
 
     def test_tool_call_timeout_cannot_be_smaller_than_reviewer_timeout(self) -> None:
         os.environ["OPENROUTER_API_KEY"] = "test"
@@ -182,4 +184,3 @@ class TestTimeoutMessages(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

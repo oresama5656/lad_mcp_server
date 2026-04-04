@@ -155,7 +155,7 @@ class Settings:
             lad_serena_max_tool_calls=_get_int("LAD_SERENA_MAX_TOOL_CALLS", 32),
             lad_serena_tool_timeout_seconds=_get_int("LAD_SERENA_TOOL_TIMEOUT_SECONDS", 30),
             lad_serena_max_tool_result_chars=_get_int("LAD_SERENA_MAX_TOOL_RESULT_CHARS", 12000),
-            lad_serena_max_total_chars=_get_int("LAD_SERENA_MAX_TOTAL_CHARS", 50000),
+            lad_serena_max_total_chars=_get_int("LAD_SERENA_MAX_TOTAL_CHARS", 100000),
             lad_serena_max_dir_entries=_get_int("LAD_SERENA_MAX_DIR_ENTRIES", 100),
             lad_serena_max_search_results=_get_int("LAD_SERENA_MAX_SEARCH_RESULTS", 20),
         )

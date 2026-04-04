@@ -66,11 +66,14 @@ class SerenaContext:
             return SerenaContext(repo_root=repo_root, limits=limits)
         return None
 
-    def _cap_and_track(self, content: str) -> str:
+    def _budget_snapshot(self, *, emitted_chars_this_call: int) -> dict[str, int]:
         remaining = max(self._limits.max_total_chars - self._total_chars_emitted, 0)
-        capped = content[: min(len(content), self._limits.max_tool_result_chars, remaining)]
-        self._total_chars_emitted += len(capped)
-        return capped
+        return {
+            "max_total_chars": int(self._limits.max_total_chars),
+            "used_chars": int(self._total_chars_emitted),
+            "remaining_chars": int(remaining),
+            "emitted_chars_this_call": int(emitted_chars_this_call),
+        }
 
     def _safe_resolve_under_repo(self, relative_path: str) -> Path:
         try:
@@ -227,10 +230,36 @@ class SerenaContext:
             raise SerenaToolError(f"Unknown tool: {name}")
 
         self.used_tools.add(name)
-        out = json.dumps(result, ensure_ascii=False, indent=2)
-        out = redact_text(out)
-        out = self._cap_and_track(out)
-        return out
+
+        raw_result_json = json.dumps(result, ensure_ascii=False, indent=2)
+        raw_result_json = redact_text(raw_result_json)
+        remaining_before = max(self._limits.max_total_chars - self._total_chars_emitted, 0)
+
+        if remaining_before <= 0:
+            payload = {
+                "tool_status": "budget_exhausted",
+                "tool_name": name,
+                "tool_budget": self._budget_snapshot(emitted_chars_this_call=0),
+                "error": "serena output budget exhausted",
+                "hint": "Reduce scope or increase LAD_SERENA_MAX_TOTAL_CHARS.",
+                "tool_result_json": "",
+            }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+
+        max_result_chars = min(len(raw_result_json), int(self._limits.max_tool_result_chars), int(remaining_before))
+        emitted_result_json = raw_result_json[:max_result_chars]
+        self._total_chars_emitted += len(emitted_result_json)
+
+        status = "ok" if len(emitted_result_json) == len(raw_result_json) else "truncated"
+        payload: dict[str, Any] = {
+            "tool_status": status,
+            "tool_name": name,
+            "tool_budget": self._budget_snapshot(emitted_chars_this_call=len(emitted_result_json)),
+            "tool_result_json": emitted_result_json,
+        }
+        if status == "truncated":
+            payload["note"] = "Tool output was truncated by per-call or total Serena budget limits."
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _list_memories(self) -> dict[str, Any]:
         if not self.memories_dir.is_dir():
