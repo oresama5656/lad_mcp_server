@@ -57,6 +57,17 @@ def _build_tool_message(tool_call_id: str, name: str, content: str) -> dict[str,
     return {"role": "tool", "tool_call_id": tool_call_id, "name": name, "content": content}
 
 
+def _build_assistant_tool_calls_message(
+    tool_calls: list[dict[str, Any]],
+    *,
+    content: str | None = None,
+) -> dict[str, Any]:
+    msg: dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
+    if content:
+        msg["content"] = content
+    return msg
+
+
 def _build_system_message(content: str) -> dict[str, Any]:
     return {"role": "system", "content": content}
 
@@ -158,13 +169,14 @@ class ReviewService:
     @staticmethod
     def _is_retryable_tool_choice_compatibility_error(exc: OpenRouterClientError) -> bool:
         msg = _exc_message(exc).lower()
-        if "tool_choice" not in msg:
+        if "tool_choice" not in msg and "tool choice" not in msg:
             return False
         return (
             "no endpoints found" in msg
             or "support the provided" in msg
             or "unsupported" in msg
             or "routing" in msg
+            or "must be auto" in msg
         )
 
     @staticmethod
@@ -724,6 +736,13 @@ class ReviewService:
             if serena_ctx is None or tools is None:
                 # Should not happen: model returned tool calls but tools weren't provided.
                 return (result.content or "") + "\n\n*(Tool calls were requested, but no tools were available.)\n"
+
+            messages.append(
+                _build_assistant_tool_calls_message(
+                    result.tool_calls,
+                    content=result.content,
+                )
+            )
 
             if remaining_tool_calls <= 0:
                 messages.append(_build_system_message(force_finalize_system_message()))
