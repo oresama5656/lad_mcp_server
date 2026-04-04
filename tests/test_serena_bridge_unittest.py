@@ -8,6 +8,37 @@ from lad_mcp_server.serena_bridge import SerenaContext, SerenaLimits, SerenaTool
 
 
 class TestSerenaBridge(unittest.TestCase):
+    def test_tool_schemas_include_read_file_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            schemas = ctx.tool_schemas()
+            rf_window = next(s for s in schemas if (s.get("function") or {}).get("name") == "read_file_window")
+            desc = ((rf_window.get("function") or {}).get("description") or "").lower()
+            params = (rf_window.get("function") or {}).get("parameters") or {}
+            self.assertEqual(params.get("required"), ["path", "start_line", "num_lines"])
+            props = params.get("properties") or {}
+            self.assertIn("path", props)
+            self.assertIn("start_line", props)
+            self.assertIn("num_lines", props)
+            self.assertEqual((props["start_line"] or {}).get("type"), "integer")
+            self.assertEqual((props["num_lines"] or {}).get("type"), "integer")
+            self.assertEqual((props["start_line"] or {}).get("minimum"), 1)
+            self.assertEqual((props["num_lines"] or {}).get("minimum"), 0)
+            self.assertIn("json", desc)
+            self.assertIn("function", desc)
+
     def test_detect_requires_serena_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -81,6 +112,106 @@ class TestSerenaBridge(unittest.TestCase):
             out = ctx.call_tool("read_file", "{\"path\": \"a.txt\", \"head\": 1}")
             self.assertIn("hello", out)
 
+    def test_read_file_window_returns_requested_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("l1\nl2\nl3\nl4\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "read_file_window",
+                "{\"path\": \"a.txt\", \"start_line\": 2, \"num_lines\": 2}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["path"], "a.txt")
+            self.assertEqual(result["start_line"], 2)
+            self.assertEqual(result["num_lines"], 2)
+            self.assertEqual(result["content"], "l2\nl3\n")
+
+    def test_read_file_window_validates_start_and_count(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("l1\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            with self.assertRaises(SerenaToolError):
+                ctx.call_tool("read_file_window", "{\"path\": \"a.txt\", \"start_line\": 0, \"num_lines\": 1}")
+            with self.assertRaises(SerenaToolError):
+                ctx.call_tool("read_file_window", "{\"path\": \"a.txt\", \"start_line\": 1, \"num_lines\": -1}")
+
+    def test_read_file_window_start_line_beyond_eof_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("l1\nl2\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "read_file_window",
+                "{\"path\": \"a.txt\", \"start_line\": 100, \"num_lines\": 5}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["content"], "")
+
+    def test_read_file_window_num_lines_zero_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("l1\nl2\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "read_file_window",
+                "{\"path\": \"a.txt\", \"start_line\": 1, \"num_lines\": 0}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["content"], "")
+
     def test_search_for_pattern_falls_back_when_rg_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -148,6 +279,57 @@ class TestSerenaBridge(unittest.TestCase):
 
             out = ctx.call_tool("read_file", "{\"path\": \"big.txt\", \"head\": 1}")
             self.assertIn("first", out)
+
+    def test_read_file_large_head_warns_with_window_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            big = repo / "big.txt"
+            # > 1,000,000 bytes and many lines.
+            lines = "".join(f"line-{i}\n" for i in range(500_000))
+            big.write_text(lines, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=60000,
+                    max_total_chars=120000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"big.txt\", \"head\": 400}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertIn("warning", result)
+            self.assertIn("search_for_pattern", result["warning"])
+            self.assertIn("read_file_window", result["warning"])
+
+    def test_read_file_large_head_below_threshold_does_not_warn(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            big = repo / "big.txt"
+            lines = "".join(f"line-{i}\n" for i in range(500_000))
+            big.write_text(lines, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=60000,
+                    max_total_chars=120000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"big.txt\", \"head\": 399}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertNotIn("warning", result)
 
     def test_tool_output_includes_status_and_budget_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:

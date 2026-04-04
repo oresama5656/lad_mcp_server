@@ -15,7 +15,9 @@ def system_prompt_system_design_review(*, tool_calling_enabled: bool) -> str:
         "   - Always try: `project_overview`, `research_summary`\n"
         "   - If present: requirements/design constraints memories (e.g., `requirements`, `constraints`)\n"
         "4) If requirements/constraints are not in Serena memories, read `REQUIREMENTS.md` / `README.md` via `read_file`.\n"
-        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`).\n"
+        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`, `read_file_window`).\n"
+        "6) `read_file` semantics example: `head=50` means first 50 lines; `tail=30` means last 30 lines.\n"
+        "7) Recommended workflow for large files: `search_for_pattern` -> `read_file_window(path, start_line, num_lines)`.\n"
         if tool_calling_enabled
         else ""
     )
@@ -55,7 +57,9 @@ def system_prompt_code_review(*, tool_calling_enabled: bool) -> str:
         "   - Always try: `project_overview`, `research_summary`\n"
         "   - If present: requirements/design constraints memories (e.g., `requirements`, `constraints`)\n"
         "4) If requirements/constraints are not in Serena memories, read `REQUIREMENTS.md` / `README.md` via `read_file`.\n"
-        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`).\n"
+        "5) Use Serena to explore beyond the provided snippets when needed (e.g., `list_dir`, `search_for_pattern`, `find_symbol`, `read_file`, `read_file_window`).\n"
+        "6) `read_file` semantics example: `head=50` means first 50 lines; `tail=30` means last 30 lines.\n"
+        "7) Recommended workflow for large files: `search_for_pattern` -> `read_file_window(path, start_line, num_lines)`.\n"
         if tool_calling_enabled
         else ""
     )

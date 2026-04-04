@@ -10,7 +10,13 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("list_memories", p)
         self.assertIn("read_memory", p)
         self.assertIn("read_file", p)
+        self.assertIn("read_file_window", p)
         self.assertIn("search_for_pattern", p)
+        self.assertIn("head", p)
+        self.assertIn("tail", p)
+        self.assertIn("search_for_pattern", p)
+        self.assertIn("->", p)
+        self.assertIn("read_file_window", p)
 
     def test_system_design_prompt_includes_serena_workflow_when_tools_enabled(self) -> None:
         p = system_prompt_system_design_review(tool_calling_enabled=True)
@@ -18,7 +24,11 @@ class TestPrompts(unittest.TestCase):
         self.assertIn("list_memories", p)
         self.assertIn("read_memory", p)
         self.assertIn("read_file", p)
+        self.assertIn("read_file_window", p)
         self.assertIn("search_for_pattern", p)
+        self.assertIn("head", p)
+        self.assertIn("tail", p)
+        self.assertIn("->", p)
 
     def test_prompts_do_not_mention_serena_when_tools_disabled(self) -> None:
         p1 = system_prompt_code_review(tool_calling_enabled=False)
@@ -29,4 +39,3 @@ class TestPrompts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -13,6 +13,9 @@ import re
 from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.path_utils import safe_resolve_under_repo
 
+LARGE_FILE_READ_MAX_BYTES = 1_000_000
+LARGE_FILE_HEAD_WARNING_LINES = 400
+
 
 class SerenaToolError(RuntimeError):
     pass
@@ -149,7 +152,10 @@ class SerenaContext:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read a text file under the repo root (read-only).",
+                    "description": (
+                        "Read a text file under the repo root (read-only). "
+                        "Use head for first N lines and tail for last N lines."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -158,6 +164,35 @@ class SerenaContext:
                             "tail": {"type": "integer", "description": "Optional: read only last N lines."},
                         },
                         "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file_window",
+                    "description": (
+                        "Read a targeted line window from a repo file. "
+                        "start_line is 1-based; num_lines is the number of lines to read. "
+                        "Useful for targeted JSON sections and focused code inspection "
+                        "(for example, locate a function and read only its nearby implementation window)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Repo-relative file path."},
+                            "start_line": {
+                                "type": "integer",
+                                "description": "1-based line number to start from (>= 1).",
+                                "minimum": 1,
+                            },
+                            "num_lines": {
+                                "type": "integer",
+                                "description": "Number of lines to read (>= 0, 0 returns empty content).",
+                                "minimum": 0,
+                            },
+                        },
+                        "required": ["path", "start_line", "num_lines"],
                     },
                 },
             },
@@ -222,6 +257,8 @@ class SerenaContext:
             result = self._list_dir(args.get("path"))
         elif name == "read_file":
             result = self._read_file(args.get("path"), args.get("head"), args.get("tail"))
+        elif name == "read_file_window":
+            result = self._read_file_window(args.get("path"), args.get("start_line"), args.get("num_lines"))
         elif name == "search_for_pattern":
             result = self._search_for_pattern(args.get("pattern"), args.get("path"))
         elif name == "find_symbol":
@@ -462,17 +499,16 @@ class SerenaContext:
         if tail_n is not None and tail_n < 0:
             raise SerenaToolError("tail must be >= 0")
 
-        max_bytes = 1_000_000
         try:
             size = target.stat().st_size
         except OSError:
             raise SerenaToolError("failed to stat file")
 
         # Avoid loading huge files into memory unless the caller explicitly requests head/tail slices.
-        if size > max_bytes and head_n is None and tail_n is None:
+        if size > LARGE_FILE_READ_MAX_BYTES and head_n is None and tail_n is None:
             raise SerenaToolError("file is too large to read without head/tail")
 
-        if size > max_bytes and (head_n is not None or tail_n is not None):
+        if size > LARGE_FILE_READ_MAX_BYTES and (head_n is not None or tail_n is not None):
             head_lines: list[str] = []
             tail_lines: deque[str] | None = deque(maxlen=tail_n) if tail_n else None
             with target.open("r", encoding="utf-8", errors="replace") as fh:
@@ -500,4 +536,47 @@ class SerenaContext:
 
         rel = str(target.relative_to(self.repo_root))
         self.used_paths.add(rel)
-        return {"path": rel, "content": content}
+        result: dict[str, Any] = {"path": rel, "content": content}
+        if (
+            size > LARGE_FILE_READ_MAX_BYTES
+            and head_n is not None
+            and head_n >= LARGE_FILE_HEAD_WARNING_LINES
+            and tail_n is None
+        ):
+            result["warning"] = (
+                "Large file with large head request. Prefer `search_for_pattern` first, then "
+                "`read_file_window(path, start_line, num_lines)` for a focused read."
+            )
+        return result
+
+    def _read_file_window(self, path: Any, start_line: Any, num_lines: Any) -> dict[str, Any]:
+        if not isinstance(path, str) or path.strip() == "":
+            raise SerenaToolError("path must be a non-empty string")
+        target = self._safe_resolve_under_repo(path)
+        if not target.is_file():
+            raise SerenaToolError("path is not a file")
+        if not isinstance(start_line, int):
+            raise SerenaToolError("start_line must be an integer >= 1")
+        if start_line < 1:
+            raise SerenaToolError("start_line must be >= 1")
+        if not isinstance(num_lines, int):
+            raise SerenaToolError("num_lines must be an integer >= 0")
+        if num_lines < 0:
+            raise SerenaToolError("num_lines must be >= 0")
+
+        rel = str(target.relative_to(self.repo_root))
+        self.used_paths.add(rel)
+        if num_lines == 0:
+            return {"path": rel, "start_line": start_line, "num_lines": num_lines, "content": ""}
+
+        stop_line = start_line + num_lines - 1
+        lines: list[str] = []
+        with target.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, line in enumerate(fh, start=1):
+                if idx < start_line:
+                    continue
+                if idx > stop_line:
+                    break
+                lines.append(line)
+
+        return {"path": rel, "start_line": start_line, "num_lines": num_lines, "content": "".join(lines)}
