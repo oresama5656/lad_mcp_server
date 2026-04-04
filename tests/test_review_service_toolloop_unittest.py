@@ -6,6 +6,7 @@ from pathlib import Path
 from lad_mcp_server.config import Settings
 from lad_mcp_server.model_metadata import ModelMetadata, ProviderLimits
 from lad_mcp_server.openrouter_client import OpenRouterClientError
+from lad_mcp_server.prompts import force_finalize_system_message
 from lad_mcp_server.review_service import ReviewService
 
 
@@ -799,6 +800,328 @@ class TestReviewServiceToolLoop(unittest.TestCase):
             )
 
             self.assertEqual(out, "ok")
+
+    def test_empty_tool_output_adds_system_hint_and_summary(self) -> None:
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_hint = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+
+                self.saw_hint = any(
+                    msg.get("role") == "system" and "Tool budget/state failed" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=3,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=3,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertTrue(client.saw_hint)
+            self.assertIn("## Tooling Degradation Summary", out)
+
+    def test_consecutive_degraded_tool_outputs_disable_tools_and_force_finalize(self) -> None:
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return ""
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.third_call_tools_none = False
+                self.saw_force_finalize = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls in (1, 2):
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{self.calls}",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+
+                self.third_call_tools_none = tools is None
+                self.saw_force_finalize = any(
+                    msg.get("role") == "system" and msg.get("content") == force_finalize_system_message()
+                    for msg in messages
+                )
+                return type("R", (), {"content": "done", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=5,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=5,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertTrue(client.third_call_tools_none)
+            self.assertTrue(client.saw_force_finalize)
+            self.assertIn("## Tooling Degradation Summary", out)
+            self.assertIn("Consecutive guard triggered: yes", out)
+
+    def test_invalid_json_tool_output_counted_as_degradation(self) -> None:
+        class _SerenaCtx:
+            activated_project = "."
+            used_tools: set[str] = set()
+            used_memories: set[str] = set()
+            used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return "not-json"
+
+        class _Client:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_hint = False
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                }
+                            ],
+                            "raw": {},
+                        },
+                    )()
+
+                self.saw_hint = any(
+                    msg.get("role") == "system" and "Tool budget/state failed" in str(msg.get("content", ""))
+                    for msg in messages
+                )
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=3,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _Client()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=_SerenaCtx().tool_schemas(),
+                    tool_choice_supported=False,
+                    serena_ctx=_SerenaCtx(),
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=3,
+                    tool_timeout_seconds=1,
+                )
+            )
+            self.assertTrue(client.saw_hint)
+            self.assertIn("## Tooling Degradation Summary", out)
 
 
 if __name__ == "__main__":

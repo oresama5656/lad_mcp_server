@@ -37,6 +37,11 @@ CHARS_PER_TOKEN_ESTIMATE = 3  # conservative for mixed tokenizers
 OPENROUTER_CALL_TIMEOUT_SAFETY_MARGIN_SECONDS = 5  # avoid racing external tool-call deadlines
 TOOL_CHOICE_FALLBACK_TTL_SECONDS = 600
 TOOL_CHOICE_FALLBACK_CACHE_MAX_MODELS = 128
+CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD = 2
+TOOL_DEGRADATION_SYSTEM_HINT = (
+    "Tool budget/state failed for the latest tool output. "
+    "Treat recent tool output as unreliable and continue conservatively."
+)
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 atexit.register(_TOOL_EXECUTOR.shutdown, wait=False, cancel_futures=True)
@@ -74,6 +79,39 @@ def _build_system_message(content: str) -> dict[str, Any]:
 
 def _build_user_message(content: str) -> dict[str, Any]:
     return {"role": "user", "content": content}
+
+
+def _is_degraded_tool_output(content: str) -> tuple[bool, str]:
+    text = (content or "").strip()
+    if not text:
+        return True, "empty output"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return True, "invalid JSON output"
+    if not isinstance(payload, dict):
+        return True, "non-object JSON output"
+    if payload.get("tool_status") == "budget_exhausted":
+        return True, "tool_status=budget_exhausted"
+    return False, ""
+
+
+def _append_tooling_degradation_summary(
+    markdown: str,
+    *,
+    degraded_outputs_count: int,
+    consecutive_guard_triggered: bool,
+) -> str:
+    if degraded_outputs_count <= 0:
+        return markdown
+    base = markdown.rstrip()
+    summary = (
+        "\n\n## Tooling Degradation Summary\n"
+        f"- Degraded tool outputs: {degraded_outputs_count}\n"
+        f"- Consecutive guard triggered: {'yes' if consecutive_guard_triggered else 'no'}\n"
+        "- Notes: tool budget/state failed in the Serena loop; output may be partially degraded.\n"
+    )
+    return base + summary
 
 
 @dataclass(frozen=True)
@@ -692,6 +730,9 @@ class ReviewService:
     ) -> str:
         remaining_tool_calls = max_tool_calls
         did_force_project_overview = False
+        degraded_outputs_count = 0
+        consecutive_degraded_outputs = 0
+        consecutive_guard_triggered = False
 
         while True:
             tool_choice: str | dict[str, Any] | None = "auto" if tools else None
@@ -731,7 +772,11 @@ class ReviewService:
             )
 
             if not result.tool_calls:
-                return result.content or ""
+                return _append_tooling_degradation_summary(
+                    result.content or "",
+                    degraded_outputs_count=degraded_outputs_count,
+                    consecutive_guard_triggered=consecutive_guard_triggered,
+                )
 
             if serena_ctx is None or tools is None:
                 # Should not happen: model returned tool calls but tools weren't provided.
@@ -781,6 +826,20 @@ class ReviewService:
                         tool_out = json.dumps({"error": f"tool call timed out after {tool_timeout_seconds}s"})
 
                 messages.append(_build_tool_message(tc_id, fn_name, tool_out))
+
+                is_degraded, _reason = _is_degraded_tool_output(tool_out)
+                if is_degraded:
+                    degraded_outputs_count += 1
+                    consecutive_degraded_outputs += 1
+                    messages.append(_build_system_message(TOOL_DEGRADATION_SYSTEM_HINT))
+                else:
+                    consecutive_degraded_outputs = 0
+
+                if consecutive_degraded_outputs >= CONSECUTIVE_DEGRADED_TOOL_OUTPUTS_GUARD and tools is not None:
+                    consecutive_guard_triggered = True
+                    messages.append(_build_system_message(force_finalize_system_message()))
+                    tools = None
+                    break
 
 
 def _format_reviewer_error(model: str, error: str) -> str:
