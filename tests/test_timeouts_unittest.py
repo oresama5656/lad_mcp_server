@@ -54,6 +54,15 @@ class TestSettingsTimeoutDefaults(unittest.TestCase):
         s = Settings.from_env()
         self.assertEqual(s.openrouter_tool_call_timeout_seconds, 560)
 
+    def test_reviewer_model_defaults_match_documented_pair(self) -> None:
+        os.environ["OPENROUTER_API_KEY"] = "test"
+        os.environ.pop("OPENROUTER_PRIMARY_REVIEWER_MODEL", None)
+        os.environ.pop("OPENROUTER_SECONDARY_REVIEWER_MODEL", None)
+
+        s = Settings.from_env()
+        self.assertEqual(s.openrouter_primary_reviewer_model, "moonshotai/kimi-k2.5")
+        self.assertEqual(s.openrouter_secondary_reviewer_model, "minimax/minimax-m2.7")
+
 
 class TestTimeoutMessages(unittest.TestCase):
     def test_reviewer_timeout_is_actionable(self) -> None:
