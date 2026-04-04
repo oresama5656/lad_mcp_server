@@ -737,12 +737,14 @@ class ReviewService:
                 # Should not happen: model returned tool calls but tools weren't provided.
                 return (result.content or "") + "\n\n*(Tool calls were requested, but no tools were available.)\n"
 
-            messages.append(
-                _build_assistant_tool_calls_message(
-                    result.tool_calls,
-                    content=result.content,
+            executable_tool_calls = result.tool_calls[: max(remaining_tool_calls, 0)]
+            if executable_tool_calls:
+                messages.append(
+                    _build_assistant_tool_calls_message(
+                        executable_tool_calls,
+                        content=result.content,
+                    )
                 )
-            )
 
             if remaining_tool_calls <= 0:
                 messages.append(_build_system_message(force_finalize_system_message()))
@@ -750,9 +752,7 @@ class ReviewService:
                 tools = None
                 continue
 
-            for tool_call in result.tool_calls:
-                if remaining_tool_calls <= 0:
-                    break
+            for tool_call in executable_tool_calls:
                 remaining_tool_calls -= 1
 
                 tc_id = tool_call.get("id") or ""

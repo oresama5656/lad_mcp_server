@@ -677,6 +677,129 @@ class TestReviewServiceToolLoop(unittest.TestCase):
 
             self.assertEqual(out, "ok")
 
+    def test_tool_call_protocol_limits_assistant_calls_to_executed_subset(self) -> None:
+        class _SerenaCtx:
+            def __init__(self) -> None:
+                self.activated_project = "."
+                self.used_tools: set[str] = set()
+                self.used_memories: set[str] = set()
+                self.used_paths: set[str] = set()
+
+            def tool_schemas(self):
+                return [{"type": "function", "function": {"name": "list_dir", "parameters": {"type": "object"}}}]
+
+            def call_tool(self, name: str, arguments_json: str) -> str:
+                return "{}"
+
+        class _SubsetStrictClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.expected_id = "call_a"
+                self.unexpected_id = "call_b"
+
+            async def chat_completion(
+                self,
+                *,
+                model,
+                messages,
+                timeout_seconds,
+                max_output_tokens,
+                tools=None,
+                tool_choice=None,
+                extra_body=None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    return type(
+                        "R",
+                        (),
+                        {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": self.expected_id,
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                },
+                                {
+                                    "id": self.unexpected_id,
+                                    "type": "function",
+                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                },
+                            ],
+                            "raw": {},
+                        },
+                    )()
+
+                latest_assistant_tool_ids: list[str] = []
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        latest_assistant_tool_ids = [tc.get("id") for tc in (msg.get("tool_calls") or [])]
+                        break
+                tool_result_ids = [m.get("tool_call_id") for m in messages if m.get("role") == "tool"]
+
+                if latest_assistant_tool_ids != [self.expected_id] or tool_result_ids != [self.expected_id]:
+                    raise OpenRouterClientError(
+                        "OpenRouter request failed: Error code: 400 - {'error': {'message': 'Provider returned error', 'metadata': {'raw': '{\"error\":{\"message\":\"invalid params, tool call and result not match (2013)\"}}'}}}"
+                    )
+                return type("R", (), {"content": "ok", "tool_calls": [], "raw": {}})()
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            primary = "minimax/minimax-m2.7"
+            models = _ModelsStub(
+                {
+                    primary: ModelMetadata(
+                        model_id=primary,
+                        context_length=50000,
+                        supported_parameters=("tools",),
+                        provider_limits=ProviderLimits(context_length=50000, max_completion_tokens=2000),
+                    ),
+                }
+            )
+            settings = Settings(
+                openrouter_api_key="test",
+                openrouter_primary_reviewer_model=primary,
+                openrouter_secondary_reviewer_model="0",
+                openrouter_http_referer=None,
+                openrouter_x_title=None,
+                openrouter_reviewer_timeout_seconds=5,
+                openrouter_tool_call_timeout_seconds=10,
+                openrouter_max_concurrent_requests=2,
+                openrouter_fixed_output_tokens=1000,
+                openrouter_context_overhead_tokens=2000,
+                openrouter_model_metadata_ttl_seconds=3600,
+                openrouter_max_input_chars=10000,
+                openrouter_include_reasoning=False,
+                lad_serena_max_tool_calls=1,
+                lad_serena_tool_timeout_seconds=1,
+                lad_serena_max_tool_result_chars=12000,
+                lad_serena_max_total_chars=50000,
+                lad_serena_max_dir_entries=100,
+                lad_serena_max_search_results=20,
+            )
+            client = _SubsetStrictClient()
+            service = ReviewService(repo_root=repo, settings=settings, openrouter_client=client, models_client=models)
+            serena_ctx = _SerenaCtx()
+            tools = serena_ctx.tool_schemas()
+
+            out = asyncio.run(
+                service._tool_loop(
+                    model=primary,
+                    messages=[{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                    tools=tools,
+                    tool_choice_supported=False,
+                    serena_ctx=serena_ctx,
+                    extra_body=None,
+                    reviewer_timeout_seconds=5,
+                    max_output_tokens=10,
+                    max_tool_calls=1,
+                    tool_timeout_seconds=1,
+                )
+            )
+
+            self.assertEqual(out, "ok")
+
 
 if __name__ == "__main__":
     unittest.main()
