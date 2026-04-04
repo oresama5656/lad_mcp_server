@@ -60,6 +60,29 @@ class TestSerenaBridge(unittest.TestCase):
             self.assertIn("json", desc)
             self.assertIn("function", desc)
 
+    def test_tool_schemas_include_search_substring_in_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            schemas = ctx.tool_schemas()
+            tool = next(s for s in schemas if (s.get("function") or {}).get("name") == "search_substring_in_file")
+            params = (tool.get("function") or {}).get("parameters") or {}
+            self.assertEqual(params.get("required"), ["path", "substring"])
+            props = params.get("properties") or {}
+            self.assertIn("path", props)
+            self.assertIn("substring", props)
+
     def test_detect_requires_serena_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -256,6 +279,171 @@ class TestSerenaBridge(unittest.TestCase):
                 out = ctx.call_tool("search_for_pattern", "{\"pattern\": \"hello\", \"path\": \"src\"}")
             self.assertIn("matches", out)
             self.assertIn("src/a.txt", out)
+
+    def test_search_substring_in_file_returns_count_and_contexts_under_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "xxTARGETyy\nabcTARGETdef\n"
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=10000,
+                    max_total_chars=20000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"TARGET\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+
+            self.assertEqual(result["path"], "a.txt")
+            self.assertEqual(result["count"], 2)
+            self.assertIn("occurrences", result)
+            self.assertEqual(len(result["occurrences"]), 2)
+
+            indices = [content.find("TARGET"), content.find("TARGET", content.find("TARGET") + len("TARGET"))]
+            self.assertEqual([o["index"] for o in result["occurrences"]], indices)
+            self.assertEqual([o["line"] for o in result["occurrences"]], [1, 2])
+
+            for occ, idx in zip(result["occurrences"], indices):
+                head = content[max(0, idx - 100) : idx]
+                tail_start = idx + len("TARGET")
+                tail = content[tail_start : tail_start + 100]
+                self.assertEqual(occ["context"], head + "TARGET" + tail)
+
+    def test_search_substring_in_file_uses_non_overlapping_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("aaaaa", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"aa\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["count"], 2)
+            self.assertEqual([o["index"] for o in result["occurrences"]], [0, 2])
+
+    def test_search_substring_in_file_exactly_ten_omits_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text(("ab-" * 10), encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"ab\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["count"], 10)
+            self.assertNotIn("occurrences", result)
+
+    def test_search_substring_in_file_zero_matches_omits_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("hello\nworld\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"HELLO\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["count"], 0)
+            self.assertNotIn("occurrences", result)
+
+    def test_search_substring_in_file_rejects_empty_substring(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("hello\nworld\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            with self.assertRaises(SerenaToolError):
+                ctx.call_tool(
+                    "search_substring_in_file",
+                    "{\"path\": \"a.txt\", \"substring\": \"\"}",
+                )
+
+    def test_search_substring_in_file_rejects_large_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            big = repo / "big.txt"
+            big.write_bytes(b"a" * 1_000_001)
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=4000,
+                    max_total_chars=8000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            with self.assertRaises(SerenaToolError):
+                ctx.call_tool(
+                    "search_substring_in_file",
+                    "{\"path\": \"big.txt\", \"substring\": \"a\"}",
+                )
 
     def test_read_file_rejects_large_file_without_head_tail(self) -> None:
         with tempfile.TemporaryDirectory() as td:

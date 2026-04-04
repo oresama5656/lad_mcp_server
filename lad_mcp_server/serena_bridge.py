@@ -226,6 +226,26 @@ class SerenaContext:
             {
                 "type": "function",
                 "function": {
+                    "name": "search_substring_in_file",
+                    "description": (
+                        "Search a single repo file for a literal, case-sensitive substring. "
+                        "Returns total non-overlapping match count. "
+                        "If count is less than 10, includes per-occurrence location and compact context "
+                        "(up to 100 chars before + substring + up to 100 chars after)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Repo-relative file path."},
+                            "substring": {"type": "string", "description": "Literal substring to search for."},
+                        },
+                        "required": ["path", "substring"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "find_symbol",
                     "description": "Best-effort symbol lookup (Python def/class) across repo files.",
                     "parameters": {
@@ -275,6 +295,8 @@ class SerenaContext:
             result = self._read_file_window(args.get("path"), args.get("start_line"), args.get("num_lines"))
         elif name == "search_for_pattern":
             result = self._search_for_pattern(args.get("pattern"), args.get("path"))
+        elif name == "search_substring_in_file":
+            result = self._search_substring_in_file(args.get("path"), args.get("substring"))
         elif name == "find_symbol":
             result = self._find_symbol(args.get("name"), args.get("path"))
         else:
@@ -525,6 +547,57 @@ class SerenaContext:
         # Best-effort: search for python def/class declarations.
         pattern = rf"^(?:def|class)\s+{name}\b"
         return self._search_for_pattern(pattern, path)
+
+    def _search_substring_in_file(self, path: Any, substring: Any) -> dict[str, Any]:
+        if not isinstance(path, str) or path.strip() == "":
+            raise SerenaToolError("path must be a non-empty string")
+        if not isinstance(substring, str) or substring == "":
+            raise SerenaToolError("substring must be a non-empty string")
+
+        target = self._safe_resolve_under_repo(path)
+        if not target.is_file():
+            raise SerenaToolError("path is not a file")
+        try:
+            size = target.stat().st_size
+        except OSError:
+            raise SerenaToolError("failed to stat file")
+        if size > LARGE_FILE_READ_MAX_BYTES:
+            raise SerenaToolError("file is too large to search")
+
+        text = target.read_text(encoding="utf-8", errors="replace")
+        rel = str(target.relative_to(self.repo_root))
+        self.used_paths.add(rel)
+
+        sub_len = len(substring)
+        count = 0
+        match_positions: list[int] = []
+        search_from = 0
+        while True:
+            pos = text.find(substring, search_from)
+            if pos < 0:
+                break
+            count += 1
+            if count < 10:
+                match_positions.append(pos)
+            search_from = pos + sub_len
+
+        result: dict[str, Any] = {"path": rel, "count": count}
+        if 0 < count < 10:
+            occurrences: list[dict[str, Any]] = []
+            for pos in match_positions:
+                line = text.count("\n", 0, pos) + 1
+                head = text[max(0, pos - 100) : pos]
+                tail_start = pos + sub_len
+                tail = text[tail_start : tail_start + 100]
+                occurrences.append(
+                    {
+                        "index": pos,
+                        "line": line,
+                        "context": head + substring + tail,
+                    }
+                )
+            result["occurrences"] = occurrences
+        return result
 
     def _read_file(self, path: Any, head: Any, tail: Any) -> dict[str, Any]:
         if not isinstance(path, str) or path.strip() == "":
