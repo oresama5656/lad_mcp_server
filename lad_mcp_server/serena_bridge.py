@@ -13,8 +13,10 @@ import re
 from lad_mcp_server.redaction import redact_text
 from lad_mcp_server.path_utils import safe_resolve_under_repo
 
-LARGE_FILE_READ_MAX_BYTES = 1_000_000
+LARGE_FILE_READ_MAX_BYTES = 100_000_000
 LARGE_FILE_HEAD_WARNING_LINES = 400
+READ_FILE_TRUNCATE_THRESHOLD = 10_000
+READ_FILE_MAX_HEAD_TAIL_CHARS = 1_000
 BASELINE_REQUIRED_MEMORIES = ("project_overview.md", "research_summary.md")
 
 
@@ -166,7 +168,10 @@ class SerenaContext:
                     "name": "read_file",
                     "description": (
                         "Read a text file under the repo root (read-only). "
-                        "Use head for first N lines and tail for last N lines."
+                        "For files larger than 10,000 characters, returns only the first 1000 and last 1000 "
+                        "characters (in 'content' and 'tail' fields) plus 'file_size'. "
+                        "For smaller files, returns full content. "
+                        "Use head for first N lines and tail for last N lines (small files only)."
                     ),
                     "parameters": {
                         "type": "object",
@@ -229,9 +234,10 @@ class SerenaContext:
                     "name": "search_substring_in_file",
                     "description": (
                         "Search a single repo file for a literal, case-sensitive substring. "
-                        "Returns total non-overlapping match count. "
-                        "If count is less than 10, includes per-occurrence location and compact context "
-                        "(up to 100 chars before + substring + up to 100 chars after)."
+                        "Returns total non-overlapping match count, file_size in characters, and up to 30 occurrences. "
+                        "First 5 occurrences include index, line, and context (up to 100 chars before + substring + up to 100 chars after). "
+                        "Occurrences 6-30 include index and line only. "
+                        "Files up to 100 MB are supported."
                     ),
                     "parameters": {
                         "type": "object",
@@ -577,25 +583,24 @@ class SerenaContext:
             if pos < 0:
                 break
             count += 1
-            if count < 10:
+            if count <= 30:
                 match_positions.append(pos)
             search_from = pos + sub_len
 
-        result: dict[str, Any] = {"path": rel, "count": count}
-        if 0 < count < 10:
+        result: dict[str, Any] = {"path": rel, "file_size": len(text), "count": count}
+        if count > 0:
             occurrences: list[dict[str, Any]] = []
-            for pos in match_positions:
+            for i, pos in enumerate(match_positions):
                 line = text.count("\n", 0, pos) + 1
-                head = text[max(0, pos - 100) : pos]
-                tail_start = pos + sub_len
-                tail = text[tail_start : tail_start + 100]
-                occurrences.append(
-                    {
-                        "index": pos,
-                        "line": line,
-                        "context": head + substring + tail,
-                    }
-                )
+                if i < 5:
+                    head = text[max(0, pos - 100) : pos]
+                    tail_start = pos + sub_len
+                    tail = text[tail_start : tail_start + 100]
+                    occurrences.append(
+                        {"index": pos, "line": line, "context": head + substring + tail}
+                    )
+                else:
+                    occurrences.append({"index": pos, "line": line})
             result["occurrences"] = occurrences
         return result
 
@@ -618,10 +623,14 @@ class SerenaContext:
         except OSError:
             raise SerenaToolError("failed to stat file")
 
-        # Avoid loading huge files into memory unless the caller explicitly requests head/tail slices.
+        # Reject files > LARGE_FILE_READ_MAX_BYTES without explicit head/tail.
         if size > LARGE_FILE_READ_MAX_BYTES and head_n is None and tail_n is None:
             raise SerenaToolError("file is too large to read without head/tail")
 
+        rel = str(target.relative_to(self.repo_root))
+        self.used_paths.add(rel)
+
+        # Streaming path for files > LARGE_FILE_READ_MAX_BYTES with head/tail.
         if size > LARGE_FILE_READ_MAX_BYTES and (head_n is not None or tail_n is not None):
             head_lines: list[str] = []
             tail_lines: deque[str] | None = deque(maxlen=tail_n) if tail_n else None
@@ -639,29 +648,40 @@ class SerenaContext:
                     lines.append("\n[NOTE: Middle of file omitted due to size.]\n")
                 lines.extend(list(tail_lines))
             content = "".join(lines)
-        else:
-            text = target.read_text(encoding="utf-8", errors="replace")
-            lines = text.splitlines(keepends=True)
-            if head_n is not None:
-                lines = lines[:head_n]
-            if tail_n is not None:
-                lines = lines[-tail_n:] if tail_n != 0 else []
-            content = "".join(lines)
+            result: dict[str, Any] = {"path": rel, "content": content}
+            if (
+                size > LARGE_FILE_READ_MAX_BYTES
+                and head_n is not None
+                and head_n >= LARGE_FILE_HEAD_WARNING_LINES
+                and tail_n is None
+            ):
+                result["warning"] = (
+                    "Large file with large head request. Prefer `search_for_pattern` first, then "
+                    "`read_file_window(path, start_line, num_lines)` for a focused read."
+                )
+            return result
 
-        rel = str(target.relative_to(self.repo_root))
-        self.used_paths.add(rel)
-        result: dict[str, Any] = {"path": rel, "content": content}
-        if (
-            size > LARGE_FILE_READ_MAX_BYTES
-            and head_n is not None
-            and head_n >= LARGE_FILE_HEAD_WARNING_LINES
-            and tail_n is None
-        ):
-            result["warning"] = (
-                "Large file with large head request. Prefer `search_for_pattern` first, then "
-                "`read_file_window(path, start_line, num_lines)` for a focused read."
-            )
-        return result
+        # Normal path: load full text.
+        text = target.read_text(encoding="utf-8", errors="replace")
+
+        # Auto-truncate files above the character threshold.
+        if len(text) > READ_FILE_TRUNCATE_THRESHOLD:
+            return {
+                "path": rel,
+                "content": text[:READ_FILE_MAX_HEAD_TAIL_CHARS],
+                "tail": text[-READ_FILE_MAX_HEAD_TAIL_CHARS:],
+                "file_size": len(text),
+            }
+
+        # Small file: apply optional line-based head/tail slicing.
+        lines = text.splitlines(keepends=True)
+        if head_n is not None:
+            lines = lines[:head_n]
+        if tail_n is not None:
+            lines = lines[-tail_n:] if tail_n != 0 else []
+        content = "".join(lines)
+
+        return {"path": rel, "content": content}
 
     def _read_file_window(self, path: Any, start_line: Any, num_lines: Any) -> dict[str, Any]:
         if not isinstance(path, str) or path.strip() == "":

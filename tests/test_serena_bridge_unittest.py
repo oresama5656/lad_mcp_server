@@ -156,6 +156,118 @@ class TestSerenaBridge(unittest.TestCase):
             out = ctx.call_tool("read_file", "{\"path\": \"a.txt\", \"head\": 1}")
             self.assertIn("hello", out)
 
+    def test_read_file_small_file_returns_full_content(self) -> None:
+        """Files <= 10,000 chars return full content, no tail/file_size keys."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "a" * 10_000  # exactly at threshold
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=20_000,
+                    max_total_chars=40_000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["path"], "a.txt")
+            self.assertEqual(result["content"], content)
+            self.assertNotIn("tail", result)
+            self.assertNotIn("file_size", result)
+
+    def test_read_file_truncates_above_threshold(self) -> None:
+        """Files > 10,000 chars are auto-truncated to 1000 head + 1000 tail + file_size."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "A" * 5_000 + "B" * 5_001  # 10,001 chars
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=5_000,
+                    max_total_chars=10_000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["path"], "a.txt")
+            self.assertEqual(result["file_size"], 10_001)
+            self.assertEqual(len(result["content"]), 1_000)
+            self.assertEqual(result["content"], "A" * 1_000)
+            self.assertEqual(len(result["tail"]), 1_000)
+            self.assertEqual(result["tail"], "B" * 1_000)
+
+    def test_read_file_truncated_content_at_exact_threshold_boundary(self) -> None:
+        """File of exactly 10,001 chars: first 1000 and last 1000 overlap by 999."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "x" * 10_001
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=5_000,
+                    max_total_chars=10_000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["file_size"], 10_001)
+            # Both head and tail are the same char, so content == tail
+            self.assertEqual(result["content"], "x" * 1_000)
+            self.assertEqual(result["tail"], "x" * 1_000)
+
+    def test_read_file_large_ignores_head_tail_params(self) -> None:
+        """For files > 10,000 chars, head/tail line params are ignored."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            lines = [f"line-{i:05d}" for i in range(2_000)]  # ~22,000 chars > 10,000
+            content = "\n".join(lines)
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=5_000,
+                    max_total_chars=10_000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            # head=3 should be ignored — output is always 1000 head chars + 1000 tail chars
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\", \"head\": 3}")
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertIn("tail", result)
+            self.assertIn("file_size", result)
+            self.assertEqual(len(result["content"]), 1_000)
+            self.assertEqual(len(result["tail"]), 1_000)
+
     def test_read_file_window_returns_requested_lines(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -306,6 +418,7 @@ class TestSerenaBridge(unittest.TestCase):
             result = json.loads(payload["tool_result_json"])
 
             self.assertEqual(result["path"], "a.txt")
+            self.assertEqual(result["file_size"], len(content))
             self.assertEqual(result["count"], 2)
             self.assertIn("occurrences", result)
             self.assertEqual(len(result["occurrences"]), 2)
@@ -344,13 +457,15 @@ class TestSerenaBridge(unittest.TestCase):
             payload = json.loads(out)
             result = json.loads(payload["tool_result_json"])
             self.assertEqual(result["count"], 2)
+            self.assertEqual(result["file_size"], 5)
             self.assertEqual([o["index"] for o in result["occurrences"]], [0, 2])
 
-    def test_search_substring_in_file_exactly_ten_omits_occurrences(self) -> None:
+    def test_search_substring_in_file_six_to_ten_matches_index_only(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             (repo / ".serena").mkdir()
-            (repo / "a.txt").write_text(("ab-" * 10), encoding="utf-8")
+            content = "ab-" * 10
+            (repo / "a.txt").write_text(content, encoding="utf-8")
             ctx = SerenaContext.detect(
                 repo,
                 SerenaLimits(
@@ -370,7 +485,84 @@ class TestSerenaBridge(unittest.TestCase):
             payload = json.loads(out)
             result = json.loads(payload["tool_result_json"])
             self.assertEqual(result["count"], 10)
-            self.assertNotIn("occurrences", result)
+            self.assertEqual(result["file_size"], len(content))
+            self.assertIn("occurrences", result)
+            self.assertEqual(len(result["occurrences"]), 10)
+            # First 5 have context, 6-10 have index+line only
+            for i, occ in enumerate(result["occurrences"]):
+                self.assertIn("index", occ)
+                self.assertIn("line", occ)
+                if i < 5:
+                    self.assertIn("context", occ)
+                else:
+                    self.assertNotIn("context", occ)
+
+    def test_search_substring_in_file_exactly_thirty_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "xy-" * 30  # 30 occurrences of "xy"
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=10000,
+                    max_total_chars=20000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"xy\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["count"], 30)
+            self.assertEqual(result["file_size"], len(content))
+            self.assertIn("occurrences", result)
+            self.assertEqual(len(result["occurrences"]), 30)
+            # First 5 have context, rest have index+line only
+            for i, occ in enumerate(result["occurrences"]):
+                self.assertIn("index", occ)
+                self.assertIn("line", occ)
+                if i < 5:
+                    self.assertIn("context", occ)
+                else:
+                    self.assertNotIn("context", occ)
+
+    def test_search_substring_in_file_over_thirty_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            content = "ab-" * 50  # 50 occurrences of "ab"
+            (repo / "a.txt").write_text(content, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=10000,
+                    max_total_chars=20000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool(
+                "search_substring_in_file",
+                "{\"path\": \"a.txt\", \"substring\": \"ab\"}",
+            )
+            payload = json.loads(out)
+            result = json.loads(payload["tool_result_json"])
+            self.assertEqual(result["count"], 50)
+            self.assertEqual(result["file_size"], len(content))
+            self.assertIn("occurrences", result)
+            # Occurrences list capped at 30
+            self.assertEqual(len(result["occurrences"]), 30)
 
     def test_search_substring_in_file_zero_matches_omits_occurrences(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -396,6 +588,7 @@ class TestSerenaBridge(unittest.TestCase):
             payload = json.loads(out)
             result = json.loads(payload["tool_result_json"])
             self.assertEqual(result["count"], 0)
+            self.assertEqual(result["file_size"], len("hello\nworld\n"))
             self.assertNotIn("occurrences", result)
 
     def test_search_substring_in_file_rejects_empty_substring(self) -> None:
@@ -426,7 +619,7 @@ class TestSerenaBridge(unittest.TestCase):
             repo = Path(td)
             (repo / ".serena").mkdir()
             big = repo / "big.txt"
-            big.write_bytes(b"a" * 1_000_001)
+            big.write_bytes(b"a" * 100_000_001)
             ctx = SerenaContext.detect(
                 repo,
                 SerenaLimits(
@@ -450,7 +643,7 @@ class TestSerenaBridge(unittest.TestCase):
             repo = Path(td)
             (repo / ".serena").mkdir()
             big = repo / "big.txt"
-            big.write_bytes(b"a" * 1_000_001)
+            big.write_bytes(b"a" * 100_000_001)
             ctx = SerenaContext.detect(
                 repo,
                 SerenaLimits(
@@ -549,9 +742,12 @@ class TestSerenaBridge(unittest.TestCase):
             repo = Path(td)
             (repo / ".serena").mkdir()
             big = repo / "big.txt"
-            # > 1,000,000 bytes and many lines.
-            lines = "".join(f"line-{i}\n" for i in range(500_000))
-            big.write_text(lines, encoding="utf-8")
+            # > 100 MB with many lines (100 bytes per line, ~110 MB total).
+            line = b"x" * 99 + b"\n"
+            chunk = line * 100_000
+            with big.open("wb") as f:
+                for _ in range(11):
+                    f.write(chunk)
             ctx = SerenaContext.detect(
                 repo,
                 SerenaLimits(
@@ -576,8 +772,11 @@ class TestSerenaBridge(unittest.TestCase):
             repo = Path(td)
             (repo / ".serena").mkdir()
             big = repo / "big.txt"
-            lines = "".join(f"line-{i}\n" for i in range(500_000))
-            big.write_text(lines, encoding="utf-8")
+            line = b"x" * 99 + b"\n"
+            chunk = line * 100_000
+            with big.open("wb") as f:
+                for _ in range(11):
+                    f.write(chunk)
             ctx = SerenaContext.detect(
                 repo,
                 SerenaLimits(
