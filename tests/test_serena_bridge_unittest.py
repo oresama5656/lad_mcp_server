@@ -877,6 +877,92 @@ class TestSerenaBridge(unittest.TestCase):
             self.assertIn("hint", payload)
             self.assertEqual(payload["tool_budget"]["remaining_chars"], 0)
 
+    def test_tool_params_in_success_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("hello\nworld\n", encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\", \"head\": 1}")
+            payload = json.loads(out)
+            self.assertEqual(payload["tool_params"], {"path": "a.txt", "head": 1})
+
+    def test_tool_params_in_empty_args_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=2000,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("list_memories", "{}")
+            payload = json.loads(out)
+            self.assertEqual(payload["tool_params"], {})
+
+    def test_tool_params_in_truncated_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("x" * 500, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=40,
+                    max_total_chars=4000,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            out = ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            payload = json.loads(out)
+            self.assertEqual(payload["tool_status"], "truncated")
+            self.assertEqual(payload["tool_params"], {"path": "a.txt"})
+
+    def test_tool_params_in_budget_exhausted_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / ".serena").mkdir()
+            (repo / "a.txt").write_text("x" * 500, encoding="utf-8")
+            ctx = SerenaContext.detect(
+                repo,
+                SerenaLimits(
+                    max_dir_entries=10,
+                    max_search_results=10,
+                    max_tool_result_chars=200,
+                    max_total_chars=60,
+                    tool_timeout_seconds=1,
+                ),
+            )
+            assert ctx is not None
+            ctx.call_tool("activate_project", "{\"project\": \".\"}")
+            ctx.call_tool("read_file", "{\"path\": \"a.txt\"}")
+            out = ctx.call_tool("list_memories", "{}")
+            payload = json.loads(out)
+            self.assertEqual(payload["tool_status"], "budget_exhausted")
+            self.assertEqual(payload["tool_params"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

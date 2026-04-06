@@ -318,6 +318,7 @@ class SerenaContext:
             payload = {
                 "tool_status": "budget_exhausted",
                 "tool_name": name,
+                "tool_params": args,
                 "tool_budget": self._budget_snapshot(emitted_chars_this_call=0),
                 "error": "serena output budget exhausted",
                 "hint": "Reduce scope or increase LAD_SERENA_MAX_TOTAL_CHARS.",
@@ -333,6 +334,7 @@ class SerenaContext:
         payload: dict[str, Any] = {
             "tool_status": status,
             "tool_name": name,
+            "tool_params": args,
             "tool_budget": self._budget_snapshot(emitted_chars_this_call=len(emitted_result_json)),
             "tool_result_json": emitted_result_json,
         }
